@@ -1,11 +1,26 @@
 const std = @import("std");
 const mibu = @import("mibu");
 
+const World = @import("World.zig");
+
+const SimState = struct {
+    timeout: i32,
+    paused: bool,
+    last_event: mibu.events.Event,
+
+    ui_done: bool,
+    ui_fade: u8,
+    event_last_ui_draw: u21,
+};
+
+const UI_TEXT_MAX_SIZE = 10;
+const UI_FADE_FACTOR = 20;
+
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const alloc = arena.allocator();
 
-    var stdout_buf: [1024]u8 = undefined;
+    var stdout_buf: [4096]u8 = undefined;
     const stdout_file = std.fs.File.stdout();
     var stdout_writer = stdout_file.writer(&stdout_buf);
     const stdout = &stdout_writer.interface;
@@ -20,134 +35,80 @@ pub fn main() !void {
     var raw_term = try mibu.term.enableRawMode(stdin_file.handle);
     defer raw_term.disableRawMode() catch {};
 
-    const term_size = try mibu.term.getSize(stdin_file.handle);
+    var term_size = try mibu.term.getSize(stdin_file.handle);
 
-    const width: usize = term_size.width;
-    const height: usize = term_size.height;
+    var seed: u64 = undefined;
+    try std.posix.getrandom(std.mem.asBytes(&seed));
+    var world = try World.initRandom(alloc, term_size.width, term_size.height, seed);
+    defer world.deinit(alloc);
 
-    const world = try alloc.alloc(u1, width * height);
-    defer alloc.free(world);
-
-    @memset(world, 0);
-    const next_world = try alloc.dupe(u1, world);
-    defer alloc.free(next_world);
-
-    var prng: std.Random.DefaultPrng = .init(blk: {
-        var seed: u64 = undefined;
-        try std.posix.getrandom(std.mem.asBytes(&seed));
-        break :blk seed;
-    }); 
-    const rand = prng.random();
-    for (world) |*cell| cell.* = rand.int(u1); 
- 
     try init_screen(stdout);
     defer deinit_screen(stdout) catch {};
 
-    try render_screen(stdout, world);
+    try render_world(stdout, world);
 
-    var paused = true;
-    var timeout: i32 = 50;
+    var state: SimState = .{
+        .paused = true,
+        .timeout = 50,
+        .last_event = undefined,
+
+        .ui_done = false,
+        .ui_fade = 255,
+        .event_last_ui_draw = undefined,
+    };
 
     main: while(true) {
-        const next = if (paused) 
-            try mibu.events.next(stdin_file)
-         else 
-            try mibu.events.nextWithTimeout(stdin_file, timeout);
+        state.last_event = try mibu.events.nextWithTimeout(stdin_file, state.timeout);
 
-        switch (next) {
+        // controls
+        switch (state.last_event) {
             .key => |k| switch (k.code) {
                 .char => |char| {
                     switch(char) {
                         'q' => break: main,
-                        
-                        'p' => paused = !paused,
 
-                        '+' => timeout -= 10,
-                        '-' => timeout += 10,
+                        'p' => state.paused = !state.paused,
 
-                        'n' => {},
+                        '+' => state.timeout -= 10,
+                        '-' => state.timeout += 10,
+
+                        'n' => {
+                            if (state.paused) {
+                                world.update();
+                                try render_world(stdout, world);
+                            }
+                        },
                         else => continue
                     }
+                    state.ui_done = false;
                 },
                 else => continue
+            },
+            .resize => {
+                term_size = try mibu.term.getSize(stdin_file.handle);
+                world.resize(term_size.width, term_size.height); // not implemented
             },
             else => {}
         }
 
-        {   // render world pipline
-            update_world(world, next_world, width);
-            try render_screen(stdout, next_world);
-            @memcpy(world, next_world);
-            @memset(next_world, 0);
+        if (!state.paused) {
+            world.update();
+            try render_world(stdout, world);
         }
+        if (!state.ui_done) {
+            state.ui_done = try render_ui(stdout, &state);
+        }
+
+        try stdout.flush();
     }
 }
 
-fn update_world(old_world: []const u1, new_world: []u1, width: usize) void {
-    var mask: u8 = 0b111_11_111; // Center
-    var i: usize = width + 1;
-    while (i < old_world.len - width - 1): (i += 1) {
-        if (i % width == 0) i += 1; // skip left border
-
-        update_at(old_world, new_world, width, mask, i);
-
-        if (i % width == width - 1) i += 1; // skip right border
-    }
-
-    mask = 0b000_11_111; // Top Border
-    i = 1;
-    while (i < width - 1): (i += 1) update_at(old_world, new_world, width, mask, i);
-
-    mask = 0b111_11_000; // Bottom Border
-    i = old_world.len - width + 1;
-    while (i < old_world.len - 1): (i += 1) update_at(old_world, new_world, width, mask, i);
-
-    mask = 0b011_01_011; // Left Border
-    i = width;
-    while (i < old_world.len - width): (i += width) update_at(old_world, new_world, width, mask, i);
-
-    mask = 0b110_10_110; // Right Border
-    i = width + width - 1;
-    while (i < old_world.len - 1): (i += width) update_at(old_world, new_world, width, mask, i);
-    
-    mask = 0b000_01_011; // Top Left Corner
-    update_at(old_world, new_world, width, mask, 0);
-
-    mask = 0b000_10_110; // Top Right Corner
-    update_at(old_world, new_world, width, mask, width - 1);
-
-    mask = 0b011_01_000; // Bottom Left Corner
-    update_at(old_world, new_world, width, mask, old_world.len - width);
-
-    mask = 0b110_10_000; // Bottom Right Corner
-    update_at(old_world, new_world, width, mask, old_world.len - 1);
-}
-
-fn update_at(old_world: []const u1, new_world: []u1, width: usize, mask: u8, i: usize) void {
-    var count: u4 = 0;
-    if (mask & 128 > 0) count += old_world[i - width - 1];
-    if (mask & 64  > 0) count += old_world[i - width];
-    if (mask & 32  > 0) count += old_world[i - width + 1];
-    if (mask & 16  > 0) count += old_world[i - 1];
-    if (mask & 8   > 0) count += old_world[i + 1];
-    if (mask & 4   > 0) count += old_world[i + width - 1];
-    if (mask & 2   > 0) count += old_world[i + width];
-    if (mask & 1   > 0) count += old_world[i + width + 1];
-
-    new_world[i] = switch(count) {
-        0...1 => 0,
-        2     => old_world[i],
-        3     => 1,
-        4...8 => 0,
-        else => unreachable
-    };
-}
 
 /////////////// SCREEN FUNCTIONS \\\\\\\\\\\\\\\
 fn init_screen(writer: *std.Io.Writer) !void {
     try mibu.term.enterAlternateScreen(writer);
     try mibu.cursor.hide(writer);
-    try mibu.cursor.goTo(writer, 0, 0);
+    try mibu.cursor.goTo(writer, 0, 1);
     try writer.flush();
 }
 
@@ -158,11 +119,59 @@ fn deinit_screen(writer: *std.Io.Writer) !void {
 }
 
 
-fn render_screen(writer: *std.Io.Writer, world: []const u1) !void {
-    for (world) |cell| {
-        try mibu.color.bg256(writer, if (cell == 1) .white else .black);
-        try writer.writeByte(' ');
+fn render_world(writer: *std.Io.Writer, world: World) !void {
+    for (world.next, 0..) |cell, i| {
+        if (world.prev[i] != cell) {
+            try mibu.cursor.goTo(writer, i % world.width, i / world.width);
+            const taint = 255 * @as(u8, cell);
+            try mibu.color.bgRGB(writer, taint, taint, taint);
+            try writer.writeByte(' ');
+        }
     }
-    try mibu.cursor.goTo(writer, 0, 0);
-    try writer.flush();
+    try mibu.cursor.goTo(writer, 0, 1);
+}
+
+fn render_ui(writer: *std.Io.Writer, state: *SimState) !bool {
+    const key = blk: {
+        if (state.last_event == .key) {
+            state.event_last_ui_draw = state.last_event.key.code.char;
+            state.ui_fade = 255;
+            break :blk state.last_event.key.code.char;
+        } else {
+            state.ui_fade -|= UI_FADE_FACTOR;
+            break :blk state.event_last_ui_draw;
+        }
+    };
+
+    const text: ?[:0]const u8 = switch (key) {
+        'p' => if (state.paused) "Paused" else "Resume",
+
+        '+' => "Speed +",
+        '-' => "Speed -",
+
+        'n' => if (state.paused) "Next" else null,
+        else => null,
+    };
+
+    if (text) |t| {
+        try mibu.color.bgRGB(writer, 0, 0, 0);
+        try mibu.color.fgRGB(writer, state.ui_fade, state.ui_fade, state.ui_fade);
+
+        try mibu.cursor.goTo(writer, 0, 1);
+        try writer.printUnicodeCodepoint('╭');
+        inline for (0..UI_TEXT_MAX_SIZE) |_| try writer.printUnicodeCodepoint('─');
+        try writer.printUnicodeCodepoint('╮');
+
+        try mibu.cursor.goTo(writer, 0, 2);
+        try writer.print(std.fmt.comptimePrint("│{{s: ^{d}.}}│", .{UI_TEXT_MAX_SIZE}), .{t});
+
+        try mibu.cursor.goTo(writer, 0, 3);
+        try writer.printUnicodeCodepoint('╰');
+        inline for (0..UI_TEXT_MAX_SIZE) |_| try writer.printUnicodeCodepoint('─');
+        try writer.printUnicodeCodepoint('╯');
+
+        try mibu.cursor.goTo(writer , 0, 1);
+    }
+
+    return state.ui_fade == 0;
 }
